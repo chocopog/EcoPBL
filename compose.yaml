@@ -1,0 +1,8 @@
+services:
+  ecopbl:
+    image: ecopbl
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    ports:
+      - 5002:5002
