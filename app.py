@@ -15,6 +15,7 @@ import config
 import data
 import model
 import plots
+import strategy
 
 app = Flask(__name__)
 PLOTS_DIR = os.path.join(os.path.dirname(__file__), "static", "plots")
@@ -43,7 +44,7 @@ def get_stocks():
 
 @app.route("/api/simulate", methods=["POST"])
 def simulate():
-    """Run full LSTM training pipeline, generate 8 plots and economic report."""
+    """Run full LSTM training pipeline, generate 8 plots, walk-forward diagnostics, and economic report."""
     try:
         req = request.get_json() or {}
 
@@ -62,19 +63,50 @@ def simulate():
 
         # 2. Ingest market data (Live Yahoo Finance with simulated fallback)
         df_raw, stock_label, is_simulated = data.load_data(ticker, start_date, end_date)
-        if len(df_raw) < 120:
+        if len(df_raw) < 80:
             return jsonify({
                 "success": False,
                 "error": f"Insufficient historical records for {ticker} ({len(df_raw)} trading days found). Please select an earlier start date."
             }), 400
 
-        # 3. Feature engineering
-        dataset, target_dates = data.build_dataset(df_raw)
+        # Market Benchmark
+        benchmark_symbol = strategy.benchmark_ticker(ticker)
+        benchmark_raw, _, benchmark_simulated = data.load_data(
+            benchmark_symbol, start_date, end_date
+        )
+
+        # 3. Walk-Forward Multi-Horizon Evaluation (5-day & 10-day)
+        horizons = [5, 10]
+        walk_forward = {}
+        diagnostic_plots = {}
+        try:
+            for horizon in horizons:
+                wf_result = strategy.run_walk_forward(
+                    df_raw, benchmark_raw, capital, tc_rate, epochs=max(3, min(epochs, 15)), horizon=horizon
+                )
+                diag_items = wf_result.pop("_diagnostics", [])
+                walk_forward[str(horizon)] = wf_result
+                filename = f"{run_id}_{horizon}_day_diagnostics.png"
+                plots.plot_walk_forward_diagnostics(
+                    diag_items,
+                    wf_result["walk_forward"],
+                    currency,
+                    os.path.join(PLOTS_DIR, filename),
+                )
+                diagnostic_plots[str(horizon)] = f"/static/plots/{filename}"
+        except Exception as wf_err:
+            print(f"Notice: Walk-forward evaluation encountered: {wf_err}")
+            walk_forward = {}
+            diagnostic_plots = {}
+
+        # 4. Feature engineering for full dataset
+        benchmark_series = benchmark_raw["Close"] if benchmark_raw is not None else None
+        dataset, target_dates = data.build_dataset(df_raw, benchmark=benchmark_series, horizon=5, tc_rate=tc_rate)
         n_total = len(dataset)
         split_idx = int(n_total * (1 - config.TEST_FRAC))
         split_date = dataset.index[split_idx]
 
-        # 4. Save initial market & theory plots
+        # 5. Save initial market & theory plots
         p1_file = f"{run_id}_01_price_history.png"
         p2_file = f"{run_id}_02_excess_demand.png"
         p3_file = f"{run_id}_03_supply_demand.png"
@@ -83,13 +115,15 @@ def simulate():
         plots.plot_excess_demand(dataset, stock_label, currency, os.path.join(PLOTS_DIR, p2_file))
         plots.plot_supply_demand(currency, os.path.join(PLOTS_DIR, p3_file))
 
-        # 5. Data preprocessing (strict chronological split, no lookahead bias)
+        # 6. Data preprocessing (strict chronological split, no lookahead bias)
         scaler_x = StandardScaler().fit(dataset[config.FEATURES].values[:split_idx])
-        scaler_y = StandardScaler().fit(dataset[["target"]].values[:split_idx])
+        # Use target_return (% price change tomorrow) for regression predictions
+        target_col = "target_return" if "target_return" in dataset.columns else "price_change"
+        scaler_y = StandardScaler().fit(dataset[[target_col]].values[:split_idx])
         target_scale = float(scaler_y.scale_[0])
 
         X_scaled = scaler_x.transform(dataset[config.FEATURES].values)
-        y_scaled = scaler_y.transform(dataset[["target"]].values).ravel()
+        y_scaled = scaler_y.transform(dataset[[target_col]].values).ravel()
 
         X_seq, y_seq = model.make_sequences(X_scaled, y_scaled, config.LOOKBACK_WINDOW)
         end_rows = np.arange(config.LOOKBACK_WINDOW - 1, n_total)
@@ -102,7 +136,7 @@ def simulate():
         X_train, y_train = X_train_full[:val_cutoff], y_train_full[:val_cutoff]
         X_val, y_val = X_train_full[val_cutoff:], y_train_full[val_cutoff:]
 
-        # 6. Train PyTorch LSTM Model
+        # 7. Train PyTorch LSTM Model
         trained_model, train_stats = model.train_lstm(
             X_train, y_train, X_val, y_val, epochs, target_scale
         )
@@ -110,7 +144,7 @@ def simulate():
         p4_file = f"{run_id}_04_training_curve.png"
         plots.plot_training_curve(train_stats["train_rmse"], train_stats["val_rmse"], os.path.join(PLOTS_DIR, p4_file))
 
-        # 7. Model evaluation on unseen test period
+        # 8. Model evaluation on unseen test period
         raw_preds = model.predict(trained_model, X_test)
         pred_returns = scaler_y.inverse_transform(raw_preds.reshape(-1, 1)).ravel()
         actual_returns = scaler_y.inverse_transform(y_test.reshape(-1, 1)).ravel()
@@ -147,23 +181,30 @@ def simulate():
             currency, os.path.join(PLOTS_DIR, p6_file)
         )
 
-        # 8. Backtest: Revenue, Cost and Profit (Firm Economics)
+        # 9. Validation-adaptive strategy parameter selection (with hybrid bull-market participation)
+        val_raw_preds = model.predict(trained_model, X_val)
+        val_pred_ret = scaler_y.inverse_transform(val_raw_preds.reshape(-1, 1)).ravel()
+        val_true_ret = scaler_y.inverse_transform(y_val.reshape(-1, 1)).ravel()
+        strategy_params = plots.select_strategy_params(val_pred_ret, val_true_ret, tc_rate, capital)
+
+        # 10. Backtest: Revenue, Cost and Profit (Firm Economics)
         p7_file = f"{run_id}_07_backtest.png"
         _, strat_summary, bh_summary = plots.plot_backtest(
-            test_dates, actual_returns, pred_returns, capital, tc_rate, currency, os.path.join(PLOTS_DIR, p7_file)
+            test_dates, actual_returns, pred_returns, capital, tc_rate, currency,
+            os.path.join(PLOTS_DIR, p7_file), strategy_params=strategy_params
         )
 
-        # 9. Investor Utility Analysis
+        # 11. Investor Utility Analysis
         p8_file = f"{run_id}_08_utility.png"
         _, du_strat, du_bh = plots.plot_utility(
             capital, strat_summary["final_wealth"], bh_summary["final_wealth"],
             currency, config.SCALE_W, os.path.join(PLOTS_DIR, p8_file)
         )
 
-        # 10. PBL Economics findings
+        # 12. PBL Economics findings
         train_data = dataset.iloc[:split_idx]
-        shortage_ret = float(train_data.loc[train_data["excess_demand"] > 0, "target"].mean() * 100)
-        surplus_ret = float(train_data.loc[train_data["excess_demand"] < 0, "target"].mean() * 100)
+        shortage_ret = float(train_data.loc[train_data["excess_demand"] > 0, "target_return"].mean() * 100) if "target_return" in train_data else 0.0
+        surplus_ret = float(train_data.loc[train_data["excess_demand"] < 0, "target_return"].mean() * 100) if "target_return" in train_data else 0.0
 
         return jsonify({
             "success": True,
@@ -173,6 +214,9 @@ def simulate():
             "is_simulated": is_simulated,
             "currency": currency,
             "capital": capital,
+            "benchmark": benchmark_symbol,
+            "benchmark_is_simulated": benchmark_simulated,
+            "transaction_cost_rate": tc_rate,
             "data_summary": {
                 "total_days": n_total,
                 "train_days": split_idx,
@@ -202,6 +246,8 @@ def simulate():
                 "buy_and_hold": bh_summary,
                 "avg_revenue_per_trade": round(strat_summary["tr"] / max(strat_summary["trades"], 1), 2),
                 "marginal_cost_per_trade": round(capital * tc_rate, 2),
+                "round_trip_cost_rate": round(2 * tc_rate, 6),
+                "strategy_params": strategy_params,
             },
             "utility_metrics": {
                 "delta_u_lstm": round(du_strat, 4),
@@ -222,6 +268,8 @@ def simulate():
                 "backtest": f"/static/plots/{p7_file}",
                 "utility": f"/static/plots/{p8_file}",
             },
+            "walk_forward_results": walk_forward,
+            "diagnostic_plots": diagnostic_plots,
         })
 
     except Exception as e:
@@ -233,4 +281,3 @@ def simulate():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-

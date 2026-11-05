@@ -34,7 +34,14 @@ TC_RATE = 0.001
 SCALE_W = 100_000
 
 # Feature columns
-FEATURES = ["price_change", "quantity_gap", "price_gap", "excess_demand"]
+FEATURES = [
+    "price_change", "quantity_gap", "price_gap", "excess_demand",
+    "momentum_5", "momentum_10", "momentum_20", "momentum_50",
+    "volatility_5", "volatility_10", "volatility_20", "volatility_50",
+    "rsi_14", "volume_momentum", "drawdown_50", "ma_slope_20",
+    "market_return", "relative_strength_20", "market_trend",
+    "market_volatility",
+]
 
 
 def get_stock_meta(ticker):
@@ -43,4 +50,3 @@ def get_stock_meta(ticker):
         return AVAILABLE_STOCKS[ticker]
     curr = "₹" if ticker.endswith((".NS", ".BO")) else "$"
     return {"name": ticker, "currency": curr, "base_price": 100.0, "volatility": 0.018}
-

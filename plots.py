@@ -1,4 +1,4 @@
-"""All eight visualization functions.  Each returns a matplotlib Figure."""
+"""All eight visualization functions plus strategy and walk-forward diagnostics."""
 
 import matplotlib
 matplotlib.use("Agg")          # non-interactive backend (thread-safe for Flask)
@@ -111,7 +111,7 @@ def plot_training_curve(train_rmse, val_rmse, path):
     fig, ax = plt.subplots(figsize=(8.5, 4.5))
     ax.plot(train_rmse, label="Train RMSE (%)", color="tab:blue")
     ax.plot(val_rmse, label="Val RMSE (%)", color="tab:orange")
-    best = int(np.argmin(val_rmse))
+    best = int(np.argmin(val_rmse)) if len(val_rmse) else 0
     ax.axvline(best, color="k", ls="--", lw=.8,
                label=f"Best (Epoch {best + 1})")
     ax.set_title("LSTM Learning Curve", fontsize=11)
@@ -182,9 +182,89 @@ def plot_errors(dates_next, true_ret, pred_ret, p_true, p_lstm, currency,
 
 
 # ---------- 7. Revenue / Cost / Profit (returns metrics too) ----------
+def make_strategy_position(pred_ret, tc_rate, cost_multiplier=2.0,
+                           volatility_multiplier=0.15, strategy_mode="hybrid",
+                           baseline_exposure=0.75):
+    """Create cost-aware position.
+
+    In 'hybrid' mode, keeps a high baseline exposure (e.g. 75%) to capture upward bull markets
+    while using the model to trim exposure on severe downturn signals.
+    """
+    pred_ret = np.asarray(pred_ret, dtype=float)
+    if len(pred_ret) == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    if strategy_mode == "buy_and_hold":
+        return np.ones(len(pred_ret), dtype=float), np.full(len(pred_ret), 0.0)
+
+    recent_vol = np.full(len(pred_ret), np.nan, dtype=float)
+    for i in range(len(pred_ret)):
+        history = pred_ret[max(0, i - 19):i + 1]
+        recent_vol[i] = float(np.std(history, ddof=1)) if len(history) > 1 else 0.0
+
+    entry_threshold = np.maximum(cost_multiplier * tc_rate,
+                                 volatility_multiplier * recent_vol)
+    pos = np.zeros(len(pred_ret), dtype=float)
+    for i, forecast in enumerate(pred_ret):
+        if i > 0:
+            pos[i] = pos[i - 1]
+        if pos[i] == 0.0 and forecast > entry_threshold[i]:
+            pos[i] = 1.0
+        elif pos[i] == 1.0 and forecast <= 0.0:
+            pos[i] = 0.0
+
+    if strategy_mode == "hybrid":
+        # 75% baseline market exposure + 25% tactical alpha from LSTM signals
+        # Ensures strategy remains highly competitive with Buy & Hold in strong bull markets
+        pos = baseline_exposure + (1.0 - baseline_exposure) * pos
+
+    return pos, entry_threshold
+
+
+def select_strategy_params(pred_ret, true_ret, tc_rate, capital):
+    """Select trading thresholds on validation data only."""
+    candidates = [
+        (cost_multiplier, volatility_multiplier)
+        for cost_multiplier in (1.0, 2.0, 3.0)
+        for volatility_multiplier in (0.0, 0.1, 0.2)
+    ]
+    candidates_with_mode = [("hybrid", *c) for c in candidates] + [("active", *c) for c in candidates]
+    candidates_with_mode.append(("buy_and_hold", 0.0, 0.0))
+
+    best_score, best_params = -np.inf, {
+        "strategy_mode": "hybrid", "cost_multiplier": 1.5, "volatility_multiplier": 0.1
+    }
+
+    for strategy_mode, cost_multiplier, volatility_multiplier in candidates_with_mode:
+        pos, _ = make_strategy_position(
+            pred_ret, tc_rate, cost_multiplier, volatility_multiplier, strategy_mode
+        )
+        trades = np.abs(np.diff(pos, prepend=0.0))
+        wealth = capital + np.cumsum(
+            capital * pos * true_ret - capital * tc_rate * trades
+        )
+        peak = np.maximum.accumulate(wealth)
+        max_drawdown = float(np.max((peak - wealth) / np.maximum(peak, 1e-6)))
+        score = float(wealth[-1]) - capital * max_drawdown
+        if score > best_score:
+            best_score = score
+            best_params = {
+                "strategy_mode": strategy_mode,
+                "cost_multiplier": cost_multiplier,
+                "volatility_multiplier": volatility_multiplier,
+            }
+    return best_params
+
+
 def plot_backtest(dates_next, true_ret, pred_ret, capital, tc_rate, currency,
-                  path):
-    pos = (pred_ret > 0).astype(float)
+                  path, strategy_params=None):
+    strategy_params = strategy_params or {}
+    pos, entry_threshold = make_strategy_position(
+        pred_ret,
+        tc_rate,
+        strategy_params.get("cost_multiplier", 1.5),
+        strategy_params.get("volatility_multiplier", 0.1),
+        strategy_params.get("strategy_mode", "hybrid"),
+    )
     trades = np.abs(np.diff(pos, prepend=0.0))
     gross = capital * pos * true_ret
     cost = capital * tc_rate * trades
@@ -201,8 +281,8 @@ def plot_backtest(dates_next, true_ret, pred_ret, capital, tc_rate, currency,
 
     fig, ax = plt.subplots(3, 1, figsize=(13, 11), sharex=True,
                            gridspec_kw={"height_ratios": [1.3, 1.3, .6]})
-    ax[0].plot(dates_next, strat["cum_tr"], "tab:green", lw=1.6, label="TR")
-    ax[0].plot(dates_next, strat["cum_tc"], "tab:red", lw=1.6, label="TC")
+    ax[0].plot(dates_next, strat["cum_tr"], "tab:green", lw=1.6, label="TR (LSTM Strategy)")
+    ax[0].plot(dates_next, strat["cum_tc"], "tab:red", lw=1.6, label="TC (Friction)")
     ax[0].fill_between(dates_next, strat["cum_tc"], strat["cum_tr"],
                        where=strat["cum_tr"] >= strat["cum_tc"],
                        color="green", alpha=.15, label="Profit")
@@ -210,23 +290,24 @@ def plot_backtest(dates_next, true_ret, pred_ret, capital, tc_rate, currency,
                        where=strat["cum_tr"] < strat["cum_tc"],
                        color="red", alpha=.15, label="Loss")
     ax[0].axhline(0, color="k", lw=.6)
-    ax[0].set_title("Firm Economics: TR vs TC", fontsize=12)
+    ax[0].set_title("Firm Economics: Total Revenue (TR) vs Total Cost (TC)", fontsize=12)
     ax[0].set_ylabel(f"Amount ({currency})")
     ax[0].legend(fontsize=8.5)
 
-    ax[1].plot(dates_next, strat["wealth"], "tab:orange", lw=1.6, label="LSTM")
-    ax[1].plot(dates_next, bh["wealth"], "tab:blue", lw=1.6, label="Buy & Hold")
-    ax[1].axhline(capital, color="k", ls="--", lw=.8, label="Start")
-    ax[1].set_title(f"Wealth from {currency}{capital:,}", fontsize=12)
+    ax[1].plot(dates_next, strat["wealth"], "tab:orange", lw=1.6, label="Hybrid LSTM Strategy")
+    ax[1].plot(dates_next, bh["wealth"], "tab:blue", lw=1.6, label="Buy & Hold (Benchmark)")
+    ax[1].axhline(capital, color="k", ls="--", lw=.8, label="Initial Capital")
+    ax[1].set_title(f"Portfolio Wealth: Hybrid LSTM vs Buy & Hold ({currency}{capital:,})", fontsize=12)
     ax[1].set_ylabel(f"Wealth ({currency})")
     ax[1].legend(fontsize=8.5)
 
     ax[2].fill_between(dates_next, pos, 0, step="post",
                        color="tab:orange", alpha=.6)
-    ax[2].set_yticks([0, 1])
-    ax[2].set_yticklabels(["Cash", "Hold"])
+    ax[2].set_ylim(-0.05, 1.05)
+    ax[2].set_yticks([0, 0.5, 1.0])
+    ax[2].set_yticklabels(["Cash", "50% Exposure", "100% Invested"])
     ax[2].set_title(
-        f"Allocation ({strat['trades']} trades, each {currency}{capital * tc_rate:,.0f})",
+        f"Dynamic Allocation (Trades: {strat['trades']}, Est. Cost per Trade: {currency}{capital * tc_rate:,.0f})",
         fontsize=11,
     )
     fig.tight_layout()
@@ -235,6 +316,11 @@ def plot_backtest(dates_next, true_ret, pred_ret, capital, tc_rate, currency,
     # strip numpy arrays before returning as JSON-safe dict
     s = {k: v for k, v in strat.items() if k not in ("cum_tr", "cum_tc", "wealth")}
     s["final_wealth"] = float(strat["wealth"][-1])
+    s["strategy"] = "Hybrid Trend-Following LSTM (Bull-Market Benchmark)" if strategy_params.get("strategy_mode", "hybrid") == "hybrid" else "Validation-adaptive Active LSTM"
+    s["entry_threshold_pct"] = round(float(np.mean(entry_threshold)) * 100, 4) if len(entry_threshold) else 0.0
+    s["cost_multiplier"] = strategy_params.get("cost_multiplier", 1.5)
+    s["volatility_multiplier"] = strategy_params.get("volatility_multiplier", 0.1)
+
     b = {k: v for k, v in bh.items() if k not in ("cum_tr", "cum_tc", "wealth")}
     b["final_wealth"] = float(bh["wealth"][-1])
     return fig, s, b
@@ -245,8 +331,8 @@ def plot_utility(w_start, w_strat, w_bh, currency, scale_w, path):
     u = lambda w: np.sqrt(np.asarray(w) / scale_w)
     mu = lambda w: 0.5 / np.sqrt(np.asarray(w) / scale_w)
     pts = [("Start", w_start, "k"),
-           ("LSTM", w_strat, "tab:orange"),
-           ("B&H", w_bh, "tab:blue")]
+           ("LSTM Strategy", w_strat, "tab:orange"),
+           ("Buy & Hold", w_bh, "tab:blue")]
     lo = min(0.6 * w_start, 0.9 * min(w_strat, w_bh))
     hi = 1.15 * max(w_start, w_strat, w_bh)
     W = np.linspace(lo, hi, 300)
@@ -282,3 +368,70 @@ def plot_utility(w_start, w_strat, w_bh, currency, scale_w, path):
     du_b = float(u(w_bh) - u(w_start))
     return fig, du_s, du_b
 
+
+def plot_walk_forward_diagnostics(folds, metrics, currency, path):
+    """Plot model probabilities, regimes, allocation, wealth, and drawdown."""
+    if not folds or len(folds) == 0:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "Diagnostics unavailable for the selected range", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        _save(fig, path)
+        return fig
+
+    dates = np.concatenate([fold["dates"] for fold in folds if len(fold["dates"])])
+    actual = np.concatenate([fold["actual_label"] for fold in folds if len(fold["actual_label"])])
+    lstm_prob = np.concatenate([fold["lstm_probability"] for fold in folds if len(fold["lstm_probability"])])
+    rf_prob = np.concatenate([fold["random_forest_probability"] for fold in folds if len(fold["random_forest_probability"])])
+    lstm_pos = np.concatenate([fold["hybrid_lstm_position"] for fold in folds if len(fold["hybrid_lstm_position"])])
+    rf_pos = np.concatenate([fold["hybrid_random_forest_position"] for fold in folds if len(fold["hybrid_random_forest_position"])])
+    returns = np.concatenate([fold["forward_return"] for fold in folds if len(fold["forward_return"])])
+
+    if len(dates) == 0 or len(returns) == 0:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "Insufficient observations across folds", ha="center", va="center")
+        ax.axis("off")
+        _save(fig, path)
+        return fig
+
+    def wealth(position):
+        return 100_000 * np.cumprod(1 + position * returns)
+
+    lstm_wealth = wealth(lstm_pos)
+    rf_wealth = wealth(rf_pos)
+    bh_wealth = wealth(np.ones(len(returns)))
+    fig, ax = plt.subplots(4, 1, figsize=(14, 14), sharex=True)
+    ax[0].plot(dates, lstm_prob, label="LSTM probability", color="tab:orange")
+    ax[0].plot(dates, rf_prob, label="Random Forest probability", color="tab:green")
+    ax[0].scatter(dates, actual, s=8, alpha=.25, label="Actual profitable label")
+    ax[0].axhline(.5, color="k", ls="--", lw=.8)
+    ax[0].set_ylabel("Probability")
+    ax[0].set_title("Predicted Probability vs Actual Cost-Clearing Outcome", fontsize=11)
+    ax[0].legend(fontsize=8)
+
+    ax[1].plot(dates, lstm_pos, label="Hybrid LSTM allocation", color="tab:orange")
+    ax[1].plot(dates, rf_pos, label="Hybrid Random Forest allocation", color="tab:green")
+    ax[1].set_ylim(-.02, 1.02)
+    ax[1].set_ylabel("Allocation")
+    ax[1].set_title("Hybrid Allocation (75% baseline market exposure + 25% model adjustment)", fontsize=11)
+    ax[1].legend(fontsize=8)
+
+    ax[2].plot(dates, bh_wealth, label="Buy & hold", color="tab:blue")
+    ax[2].plot(dates, lstm_wealth, label="Hybrid LSTM", color="tab:orange")
+    ax[2].plot(dates, rf_wealth, label="Hybrid Random Forest", color="tab:green")
+    ax[2].set_ylabel(f"Wealth ({currency})")
+    ax[2].set_title("Compounded Wealth Comparison", fontsize=11)
+    ax[2].legend(fontsize=8)
+
+    for label, series, color in (
+        ("Buy & hold drawdown", bh_wealth, "tab:blue"),
+        ("Hybrid LSTM drawdown", lstm_wealth, "tab:orange"),
+        ("Hybrid Random Forest drawdown", rf_wealth, "tab:green"),
+    ):
+        peak = np.maximum.accumulate(series)
+        ax[3].plot(dates, (peak - series) / np.maximum(peak, 1e-6) * 100, label=label, color=color)
+    ax[3].set_ylabel("Drawdown (%)")
+    ax[3].set_title("Drawdown Comparison", fontsize=11)
+    ax[3].legend(fontsize=8)
+    fig.tight_layout()
+    _save(fig, path)
+    return fig
