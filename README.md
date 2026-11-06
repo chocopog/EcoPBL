@@ -85,7 +85,7 @@ make sure you have python installed, i used python 3.14 and it worked on it
 ### Step2:
 open my github, jo link i sent and fork the repo, (between watch and star)
 ### Step3:
-oull have to connect the fork you made, so go to your own accounts repos and copy the forked repo's link
+youll have to connect the fork you made, so go to your own accounts repos and copy the forked repo's link
 ### Step4: 
 Create a project folder, then open it in VsCode or whatever IDE you use and in the terminal
 ` git clone [the link you copied]` this will fork the repo in a new folder
