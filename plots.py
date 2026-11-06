@@ -5,6 +5,7 @@ matplotlib.use("Agg")          # non-interactive backend (thread-safe for Flask)
 
 import numpy as np
 import matplotlib.pyplot as plt
+from config import TC_RATE
 
 try:
     plt.style.use("seaborn-v0_8-whitegrid")
@@ -394,7 +395,8 @@ def plot_walk_forward_diagnostics(folds, metrics, currency, path):
         return fig
 
     def wealth(position):
-        return 100_000 * np.cumprod(1 + position * returns)
+        trades = np.abs(np.diff(position, prepend=0.0))
+        return 100_000 * np.cumprod(1 + position * returns - TC_RATE * trades)
 
     lstm_wealth = wealth(lstm_pos)
     rf_wealth = wealth(rf_pos)

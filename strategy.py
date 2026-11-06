@@ -15,7 +15,7 @@ def benchmark_ticker(ticker):
     return "^NSEI" if ticker.endswith((".NS", ".BO")) else "^GSPC"
 
 
-def _metrics(returns, positions, capital, tc_rate, horizon=1):
+def _metrics(returns, positions, capital, tc_rate, horizon=1, rf_annual=0.0):
     returns = np.asarray(returns, dtype=float)
     positions = np.asarray(positions, dtype=float)
     trades = np.abs(np.diff(positions, prepend=0.0))
@@ -23,24 +23,33 @@ def _metrics(returns, positions, capital, tc_rate, horizon=1):
     wealth = capital * np.cumprod(1 + net_returns)
     daily = pd.Series(net_returns)
     periods_per_year = 252 / max(horizon, 1)
-    downside = daily[daily < 0].std(ddof=1) * np.sqrt(periods_per_year)
+    rf_period = rf_annual / periods_per_year
+    excess = daily - rf_period
+    downside_dev = float(
+        np.sqrt(np.mean(np.minimum(excess.to_numpy(), 0.0) ** 2))
+    ) if len(excess) else 0.0
     volatility = float(daily.std(ddof=1) * np.sqrt(periods_per_year)) if len(daily) > 1 else 0.0
     sharpe = float(
-        daily.mean() * np.sqrt(periods_per_year) / daily.std(ddof=1)
+        excess.mean() * np.sqrt(periods_per_year) / daily.std(ddof=1)
     ) if (len(daily) > 1 and daily.std(ddof=1) > 0) else 0.0
     sortino = float(
-        daily.mean() * np.sqrt(periods_per_year) / downside
-    ) if (downside and not np.isnan(downside) and downside > 0) else 0.0
+        excess.mean() * np.sqrt(periods_per_year) / downside_dev
+    ) if downside_dev > 0 else 0.0
     peak = np.maximum.accumulate(wealth)
     drawdown = (peak - wealth) / np.maximum(peak, 1e-6)
     years = max(len(returns) * horizon / 252, horizon / 252)
     final_w = float(wealth[-1]) if len(wealth) else float(capital)
     cagr = float((max(final_w, 1e-4) / capital) ** (1 / max(years, 1e-3)) - 1) if final_w > 0 else -1.0
 
+    prev_wealth = np.concatenate([[capital], wealth[:-1]]) if len(wealth) else np.array([])
+    transaction_cost = float(
+        np.sum(prev_wealth * tc_rate * trades)
+    ) if len(wealth) else 0.0
+
     return {
         "final_wealth": final_w,
         "profit": float(final_w - capital),
-        "transaction_cost": float(capital * tc_rate * trades.sum()),
+        "transaction_cost": transaction_cost,
         "trades": int(trades.sum()),
         "cagr": cagr,
         "volatility": volatility,
@@ -56,6 +65,8 @@ def _positions(probabilities, regimes, threshold=0.50):
     """Regime-aware allocation tuned to participate strongly in upward bull trends
 
     while defending capital during high volatility and market drawdowns.
+
+    The probability cutoffs are hand-set, not fitted on validation data.
     """
     probabilities = np.asarray(probabilities)
     positions = np.zeros(len(probabilities), dtype=float)
@@ -76,7 +87,8 @@ def _positions(probabilities, regimes, threshold=0.50):
 
 
 def run_walk_forward(df, benchmark_df, capital, tc_rate, epochs=10,
-                     horizon=5, folds=3, baseline_exposure=0.75):
+                     horizon=5, folds=3, baseline_exposure=0.75,
+                     rf_annual=0.0):
     """Evaluate LSTM and Random Forest classifiers on expanding walk-forward folds."""
     benchmark = benchmark_df["Close"].reindex(df.index).ffill() if benchmark_df is not None else None
     dataset, target_dates = data.build_dataset(df, benchmark, horizon, tc_rate)
@@ -101,11 +113,12 @@ def run_walk_forward(df, benchmark_df, capital, tc_rate, epochs=10,
         if test_end <= test_start:
             continue
         train_end = test_start
+        train_cut = train_end - horizon
         scaler = StandardScaler().fit(feature_values[:train_end])
         scaled = scaler.transform(feature_values)
         x_seq, y_seq = model.make_sequences(scaled, labels, LOOKBACK_WINDOW)
         end_rows = np.arange(LOOKBACK_WINDOW - 1, n)
-        train_mask = end_rows < train_end
+        train_mask = end_rows < train_cut
 
         test_rows = evaluation_rows[
             (evaluation_rows >= test_start) & (evaluation_rows < test_end)
@@ -121,14 +134,19 @@ def run_walk_forward(df, benchmark_df, capital, tc_rate, epochs=10,
             x_train[val_cut:], y_train[val_cut:], epochs
         )
         lstm_prob = model.predict_classifier(lstm, x_test)
-        flat_train = scaled[LOOKBACK_WINDOW - 1:train_end]
+        flat_train = scaled[LOOKBACK_WINDOW - 1:train_cut]
         flat_test = scaled[test_rows]
         rf = RandomForestClassifier(
             n_estimators=150, max_depth=6, min_samples_leaf=6,
-            class_weight="balanced", random_state=SEED, n_jobs=-1
+            class_weight="balanced", random_state=SEED, n_jobs=1
         )
-        rf.fit(flat_train, labels[LOOKBACK_WINDOW - 1:train_end])
-        rf_prob = rf.predict_proba(flat_test)[:, 1]
+        rf.fit(flat_train, labels[LOOKBACK_WINDOW - 1:train_cut])
+        rf_probabilities = rf.predict_proba(flat_test)
+        positive_class = np.flatnonzero(rf.classes_ == 1)
+        rf_prob = (
+            rf_probabilities[:, positive_class[0]]
+            if len(positive_class) else np.zeros(len(flat_test))
+        )
 
         test_returns = returns[test_rows]
         test_regimes = regimes[test_rows]
@@ -165,7 +183,9 @@ def run_walk_forward(df, benchmark_df, capital, tc_rate, epochs=10,
             continue
         all_returns = np.concatenate([item[0] for item in fold_metrics])
         all_positions = np.concatenate([item[1] for item in fold_metrics])
-        summary[name] = _metrics(all_returns, all_positions, capital, tc_rate, horizon)
+        summary[name] = _metrics(
+            all_returns, all_positions, capital, tc_rate, horizon, rf_annual
+        )
         summary[name]["folds"] = len(fold_metrics)
 
     return {

@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 import numpy as np
 import pandas as pd
+import torch
 from flask import Flask, jsonify, render_template, request
 from sklearn.preprocessing import StandardScaler
 
@@ -20,6 +21,13 @@ import strategy
 app = Flask(__name__)
 PLOTS_DIR = os.path.join(os.path.dirname(__file__), "static", "plots")
 os.makedirs(PLOTS_DIR, exist_ok=True)
+
+np.random.seed(config.SEED)
+torch.manual_seed(config.SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(config.SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 @app.route("/")
@@ -74,6 +82,18 @@ def simulate():
         benchmark_raw, _, benchmark_simulated = data.load_data(
             benchmark_symbol, start_date, end_date
         )
+        if benchmark_simulated:
+            return jsonify({
+                "success": False,
+                "error": f"Could not download benchmark {benchmark_symbol}",
+            }), 502
+
+        np.random.seed(config.SEED)
+        torch.manual_seed(config.SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
         # 3. Walk-Forward Multi-Horizon Evaluation (5-day & 10-day)
         horizons = [5, 10]
@@ -82,7 +102,9 @@ def simulate():
         try:
             for horizon in horizons:
                 wf_result = strategy.run_walk_forward(
-                    df_raw, benchmark_raw, capital, tc_rate, epochs=max(3, min(epochs, 15)), horizon=horizon
+                    df_raw, benchmark_raw, capital, tc_rate,
+                    epochs=max(3, min(epochs, 15)), horizon=horizon,
+                    rf_annual=config.RF_ANNUAL.get(benchmark_symbol, 0.04),
                 )
                 diag_items = wf_result.pop("_diagnostics", [])
                 walk_forward[str(horizon)] = wf_result
@@ -137,6 +159,12 @@ def simulate():
         X_val, y_val = X_train_full[val_cutoff:], y_train_full[val_cutoff:]
 
         # 7. Train PyTorch LSTM Model
+        np.random.seed(config.SEED)
+        torch.manual_seed(config.SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         trained_model, train_stats = model.train_lstm(
             X_train, y_train, X_val, y_val, epochs, target_scale
         )

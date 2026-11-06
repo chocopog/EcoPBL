@@ -32,6 +32,7 @@ VAL_FRAC = 0.15
 # Trading economics
 TC_RATE = 0.001
 SCALE_W = 100_000
+RF_ANNUAL = {"^NSEI": 0.065, "^GSPC": 0.04}
 
 # Feature columns
 FEATURES = [
