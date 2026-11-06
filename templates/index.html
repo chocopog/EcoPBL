@@ -368,6 +368,41 @@
       <img id="walkForwardDiagnosticsImage" src="" alt="Walk-forward prediction diagnostics" class="max-w-full h-auto">
     </div>
 
+    <div id="walkForwardTable" class="hidden bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+      <h3 class="text-lg font-bold text-slate-900">Walk-forward performance</h3>
+      <p id="walkForwardTableSubtitle" class="text-xs text-slate-500 mt-1 mb-4"></p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs text-left">
+          <thead>
+            <tr class="border-b border-slate-200 text-slate-500">
+              <th class="py-2 pr-4">Strategy</th>
+              <th class="py-2 pr-4">Final wealth</th>
+              <th class="py-2 pr-4">Profit</th>
+              <th class="py-2 pr-4">Total cost (TC)</th>
+              <th class="py-2 pr-4">Trades</th>
+              <th class="py-2 pr-4">Avg annual return</th>
+              <th class="py-2 pr-4">Risk (std dev of return)</th>
+              <th class="py-2 pr-4">Return per unit of risk</th>
+              <th class="py-2 pr-4">Return per unit of downside risk</th>
+              <th class="py-2 pr-4">Worst fall from peak</th>
+              <th class="py-2 pr-4">Periods with profit</th>
+              <th class="py-2 pr-4">Trading frequency</th>
+              <th class="py-2">Test splits</th>
+            </tr>
+          </thead>
+          <tbody id="walkForwardTableBody"></tbody>
+        </table>
+      </div>
+      <p class="text-xs text-slate-500 mt-4 leading-relaxed">
+        TR = gross gains; TC = cost per trade × trades; profit = TR − TC.
+        Opportunity cost = what a safe asset would have earned. Risk = standard deviation of returns.
+        Return per unit of risk = (average return − opportunity cost) / risk.
+        Worst fall from peak = largest drop from the highest wealth so far.
+        Hybrid = 75% always in the stock + 25% moved by the model.
+        Test splits = train on the past, test on the next block of future days.
+      </p>
+    </div>
+
     <!-- ======================== STEPWISE PLOT VIEWER ======================== -->
     <div id="plotsSection" class="hidden bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
       <div class="p-6 border-b border-slate-200 bg-slate-50/60">
@@ -830,6 +865,37 @@
               data.diagnostic_plots["5"] + `?t=${Date.now()}`;
             document.getElementById('walkForwardDiagnostics').classList.remove('hidden');
           }
+
+          const strategyLabels = {
+            lstm: 'LSTM',
+            random_forest: 'Random Forest',
+            hybrid_lstm: 'Hybrid LSTM (passive + model)',
+            hybrid_random_forest: 'Hybrid RF (passive + model)',
+            buy_and_hold: 'Buy & hold',
+            momentum: 'Momentum (20-day trend)'
+          };
+          const money = value => `${curr}${Number(value).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+          const percent = value => `${(Number(value) * 100).toFixed(2)}%`;
+          const body = document.getElementById('walkForwardTableBody');
+          body.innerHTML = Object.entries(primary).map(([key, metrics]) => `
+            <tr class="border-b border-slate-100">
+              <td class="py-2 pr-4 font-semibold whitespace-nowrap">${strategyLabels[key] || key}</td>
+              <td class="py-2 pr-4">${money(metrics.final_wealth)}</td>
+              <td class="py-2 pr-4">${money(metrics.profit)}</td>
+              <td class="py-2 pr-4">${money(metrics.transaction_cost)}</td>
+              <td class="py-2 pr-4">${metrics.trades}</td>
+              <td class="py-2 pr-4">${percent(metrics.cagr)}</td>
+              <td class="py-2 pr-4">${percent(metrics.volatility)}</td>
+              <td class="py-2 pr-4">${Number(metrics.sharpe).toFixed(2)}</td>
+              <td class="py-2 pr-4">${Number(metrics.sortino).toFixed(2)}</td>
+              <td class="py-2 pr-4">${percent(metrics.max_drawdown)}</td>
+              <td class="py-2 pr-4">${percent(metrics.win_rate)}</td>
+              <td class="py-2 pr-4">${percent(metrics.turnover)}</td>
+              <td class="py-2">${metrics.folds}</td>
+            </tr>`).join('');
+          document.getElementById('walkForwardTableSubtitle').innerText =
+            '5-day market-relative target. Percent values are fractions converted to percentages for display.';
+          document.getElementById('walkForwardTable').classList.remove('hidden');
         }
 
         // KPIs from economic backtest & forecast
