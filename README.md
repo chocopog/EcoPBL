@@ -10,7 +10,7 @@ and 10-trading-day targets, regime-aware allocation, walk-forward testing, and
 diagnostic plots.
 
 > **Important:** This project is for education and experimentation. It is not
-> financial advice, and model results do not guarantee future performance.
+> financial advice, and model results do not guarantee future performance. m
 
 ## Features
 
